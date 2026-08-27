@@ -31,6 +31,7 @@ services:
       PORT: 3001
       DATABASE_URL: postgresql://${POSTGRES_USER:-hospital_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-ehms}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       NODE_ENV: development
     ports:
       - "3001:3001"

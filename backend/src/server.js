@@ -4,21 +4,40 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const pg = require('pg');
 require('dotenv').config();
+
+const { pool } = require('./db');
+const authRoutes = require('./routes/auth');
+const { requireAuth, requireRole } = require('./middleware/auth');
+const { audit } = require('./middleware/audit');
 
 const app = express();
 
+// Behind nginx: needed for req.ip to be the real client address, which the
+// login rate limiter and audit_logs both depend on.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
+
 // Middleware
 app.use(helmet()); // Security headers
-app.use(cors()); // CORS enabled
-app.use(morgan('combined')); // Logging
-app.use(express.json()); // JSON parser
 
-// Database pool
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+// CORS: allowlist only. A wildcard would let any origin drive the API with a
+// user's token.
+const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3000')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+app.use(
+  cors({
+    origin: (origin, cb) =>
+      !origin || allowedOrigins.includes(origin)
+        ? cb(null, true)
+        : cb(new Error(`Origin ${origin} not allowed`)),
+    credentials: true,
+  })
+);
+
+app.use(morgan('combined')); // Logging
+app.use(express.json({ limit: '1mb' })); // JSON parser
 
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
@@ -39,11 +58,24 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ====================
+// AUTHENTICATION
+// ====================
+
+// Public: login, refresh. Authenticated: logout, me.
+app.use('/api/auth', authRoutes);
+
+// Everything mounted below this line requires a valid access token.
+// /api/health and /api/auth are declared above and stay public.
+app.use('/api', requireAuth);
+
+const CLINICAL = ['Admin', 'Physician', 'Nurse'];
+
+// ====================
 // PATIENT ENDPOINTS
 // ====================
 
 // GET all patients
-app.get('/api/patients', async (req, res) => {
+app.get('/api/patients', requireRole(...CLINICAL, 'Receptionist', 'Lab_Technician', 'Radiologist', 'Accountant'), audit('patient', 'READ', () => 'list'), async (req, res) => {
   try {
     const { page = 1, limit = 10, search = '' } = req.query;
     const offset = (page - 1) * limit;
@@ -83,7 +115,7 @@ app.get('/api/patients', async (req, res) => {
 });
 
 // GET patient by ID
-app.get('/api/patients/:id', async (req, res) => {
+app.get('/api/patients/:id', requireRole(...CLINICAL, 'Receptionist', 'Lab_Technician', 'Radiologist', 'Accountant'), audit('patient', 'READ', (req) => req.params.id), async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT * FROM patients WHERE id = $1',
@@ -101,7 +133,7 @@ app.get('/api/patients/:id', async (req, res) => {
 });
 
 // CREATE patient
-app.post('/api/patients', async (req, res) => {
+app.post('/api/patients', requireRole('Admin', 'Receptionist', 'Physician', 'Nurse'), audit('patient', 'CREATE', (req, body) => body?.patient_id ?? '-'), async (req, res) => {
   const client = await pool.connect();
   try {
     const {
@@ -139,7 +171,7 @@ app.post('/api/patients', async (req, res) => {
 // ====================
 
 // GET all appointments
-app.get('/api/appointments', async (req, res) => {
+app.get('/api/appointments', requireRole(...CLINICAL, 'Receptionist'), async (req, res) => {
   try {
     const { patient_id, status, start_date, end_date } = req.query;
     
@@ -187,7 +219,7 @@ app.get('/api/appointments', async (req, res) => {
 });
 
 // CREATE appointment
-app.post('/api/appointments', async (req, res) => {
+app.post('/api/appointments', requireRole('Admin', 'Receptionist', 'Physician', 'Nurse'), audit('appointment', 'CREATE'), async (req, res) => {
   try {
     const { patient_id, appointment_date, appointment_time, reason, notes } = req.body;
     
@@ -217,7 +249,7 @@ app.post('/api/appointments', async (req, res) => {
 // ====================
 
 // GET lab tests
-app.get('/api/lab-tests', async (req, res) => {
+app.get('/api/lab-tests', requireRole(...CLINICAL, 'Lab_Technician'), async (req, res) => {
   try {
     const { patient_id, status } = req.query;
     
@@ -247,7 +279,7 @@ app.get('/api/lab-tests', async (req, res) => {
 });
 
 // CREATE lab test
-app.post('/api/lab-tests', async (req, res) => {
+app.post('/api/lab-tests', requireRole('Admin', 'Physician', 'Nurse'), audit('lab_test', 'CREATE'), async (req, res) => {
   try {
     const { patient_id, test_name, notes } = req.body;
     
@@ -274,7 +306,7 @@ app.post('/api/lab-tests', async (req, res) => {
 // ====================
 
 // GET bills
-app.get('/api/bills', async (req, res) => {
+app.get('/api/bills', requireRole('Admin', 'Accountant', 'Receptionist'), async (req, res) => {
   try {
     const { patient_id, status } = req.query;
     
@@ -304,7 +336,7 @@ app.get('/api/bills', async (req, res) => {
 });
 
 // CREATE bill
-app.post('/api/bills', async (req, res) => {
+app.post('/api/bills', requireRole('Admin', 'Accountant'), audit('bill', 'CREATE'), async (req, res) => {
   try {
     const { patient_id, total_amount, description } = req.body;
     
@@ -331,7 +363,7 @@ app.post('/api/bills', async (req, res) => {
 // ====================
 
 // GET dashboard statistics
-app.get('/api/analytics/dashboard', async (req, res) => {
+app.get('/api/analytics/dashboard', requireRole('Admin', 'Accountant'), async (req, res) => {
   try {
     const stats = await Promise.all([
       pool.query('SELECT COUNT(*) as total FROM patients'),
@@ -362,10 +394,13 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
 });
 
-// Error handler
+// Error handler. Never leak stack traces or driver messages to clients.
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Internal server error' });
+  console.error(err.stack || err.message);
+  if (err.message && err.message.startsWith('Origin ')) {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+  return res.status(500).json({ error: 'Internal server error' });
 });
 
 // ====================
