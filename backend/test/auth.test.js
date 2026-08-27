@@ -95,3 +95,21 @@ test('refresh expiry is in the future and respects JWT_REFRESH_TTL', () => {
   const days = (expiry - Date.now()) / 86400000;
   assert.ok(days > 6.9 && days < 7.1, `expected ~7 days, got ${days}`);
 });
+
+test('two tokens signed in the same second are never identical', () => {
+  // iat has one-second resolution, so without a random jti rotation could hand
+  // back the exact token it was meant to replace.
+  const args = { userId: 'u1', role: 'Admin', employeeId: 'EMP001' };
+  const access = new Set([signAccessToken(args), signAccessToken(args), signAccessToken(args)]);
+  assert.strictEqual(access.size, 3);
+
+  const refresh = new Set([
+    signRefreshToken({ userId: 'u1' }),
+    signRefreshToken({ userId: 'u1' }),
+    signRefreshToken({ userId: 'u1' }),
+  ]);
+  assert.strictEqual(refresh.size, 3);
+
+  // Distinct plaintext must also mean distinct stored hashes.
+  assert.strictEqual(new Set([...refresh].map(hashToken)).size, 3);
+});
