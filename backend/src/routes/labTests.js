@@ -2,8 +2,9 @@ const express = require('express');
 
 const { pool } = require('../db');
 const { requireRole } = require('../middleware/auth');
-const { audit } = require('../middleware/audit');
+const { audit, writeAudit } = require('../middleware/audit');
 const v = require('../validators');
+const { buildUpdate, diff } = require('../updates');
 
 const router = express.Router();
 
@@ -107,5 +108,195 @@ router.post(
     }
   }
 );
+
+const TEST_RETURNING = `
+  test_id, patient_id, ordered_by, test_type, clinical_indication,
+  specimen_type, request_date, specimen_date, status, priority, created_at
+`;
+
+const UPDATE_HANDLERS = {
+  test_type: (x) => v.requireString(x, 'test_type', 100),
+  clinical_indication: (x) => v.optionalString(x, 'clinical_indication'),
+  specimen_type: (x) => v.optionalString(x, 'specimen_type', 50),
+  specimen_date: (x) => (x === null ? null : v.requireTimestamp(x, 'specimen_date')),
+  status: (x) => v.canonicalise(x, v.LAB_STATUSES, 'status'),
+  priority: (x) => v.canonicalise(x, v.LAB_PRIORITIES, 'priority'),
+};
+
+// A lab technician runs the test, so they move it through its statuses and
+// record when the specimen was taken - but they do not decide which test was
+// ordered or how urgent it is. Those belong to the ordering clinician.
+const UPDATABLE_BY_ROLE = {
+  Admin: Object.keys(UPDATE_HANDLERS),
+  Physician: Object.keys(UPDATE_HANDLERS),
+  Nurse: ['clinical_indication', 'specimen_type', 'specimen_date', 'status', 'priority'],
+  Lab_Technician: ['specimen_type', 'specimen_date', 'status'],
+};
+
+/**
+ * PATCH /api/lab-tests/:id
+ *
+ * lab_tests has no updated_at column in schema.sql, so there is nothing to touch
+ * here; audit_logs is the only record of when a test changed. That makes the
+ * audit write the point of this endpoint rather than a side effect of it.
+ */
+router.patch(
+  '/:id',
+  requireRole('Admin', 'Physician', 'Nurse', 'Lab_Technician'),
+  async (req, res, next) => {
+    const id = v.isUuid(req.params.id) ? req.params.id : null;
+    if (!id) return next(new v.ValidationError('test_id must be a UUID'));
+
+    const client = await pool.connect();
+    try {
+      const { assignments, params, changes } = buildUpdate(req.body, UPDATE_HANDLERS, {
+        allowed: UPDATABLE_BY_ROLE[req.user.role] || [],
+      });
+
+      await client.query('BEGIN');
+
+      const existing = await client.query(
+        `SELECT ${TEST_RETURNING} FROM lab_tests WHERE test_id = $1 FOR UPDATE`,
+        [id]
+      );
+      if (existing.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Lab test not found' });
+      }
+
+      const before = existing.rows[0];
+      // A completed test has a result attached to it. Changing which test it was
+      // after the fact would mislabel that result.
+      if (before.status === 'Completed' && !['Admin', 'Physician'].includes(req.user.role)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'A completed lab test cannot be modified',
+          hint: 'Order a repeat test instead',
+        });
+      }
+
+      const updated = await client.query(
+        `UPDATE lab_tests SET ${assignments.join(', ')}
+          WHERE test_id = $${params.length + 1}
+          RETURNING ${TEST_RETURNING}`,
+        [...params, id]
+      );
+
+      await client.query('COMMIT');
+
+      const { oldValues, newValues, changed } = diff(before, changes);
+      if (changed.length > 0) {
+        await writeAudit({
+          userId: req.user.userId,
+          entityType: 'lab_test',
+          entityId: id,
+          action: 'UPDATE',
+          oldValues,
+          newValues,
+          ip: req.ip,
+          client,
+        });
+      }
+
+      return res.json({ ...updated.rows[0], changed_fields: changed });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * DELETE /api/lab-tests/:id
+ *
+ * Cancels the order. A cancelled test that was already collected still matters:
+ * the specimen exists somewhere. ?purge=true is Admin only and refused once the
+ * test is Completed, because that would orphan a released result.
+ */
+router.delete('/:id', requireRole('Admin', 'Physician', 'Nurse'), async (req, res, next) => {
+  const id = v.isUuid(req.params.id) ? req.params.id : null;
+  if (!id) return next(new v.ValidationError('test_id must be a UUID'));
+
+  const purge = req.query.purge === 'true';
+  if (purge && req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only an Admin may purge a lab test' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT ${TEST_RETURNING} FROM lab_tests WHERE test_id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Lab test not found' });
+    }
+    const before = existing.rows[0];
+
+    if (purge) {
+      if (before.status === 'Completed') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'A completed lab test cannot be purged',
+          hint: 'Its result is part of the clinical record',
+        });
+      }
+      await client.query(
+        `INSERT INTO audit_logs
+           (user_id, entity_type, entity_id, action, old_values, new_values, ip_address)
+         VALUES ($1, 'lab_test', $2, 'DELETE', $3, $4, $5)`,
+        [
+          req.user.userId, id, JSON.stringify(before),
+          JSON.stringify({ deleted: 'purge' }), req.ip || null,
+        ]
+      );
+      await client.query('DELETE FROM lab_tests WHERE test_id = $1', [id]);
+      await client.query('COMMIT');
+      return res.json({ test_id: id, deleted: 'purge' });
+    }
+
+    if (before.status === 'Cancelled') {
+      await client.query('ROLLBACK');
+      return res.json({ ...before, deleted: 'soft', already_cancelled: true });
+    }
+    if (before.status === 'Completed') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'A completed lab test cannot be cancelled',
+        hint: 'The result has already been recorded',
+      });
+    }
+
+    const updated = await client.query(
+      `UPDATE lab_tests SET status = 'Cancelled'
+        WHERE test_id = $1 RETURNING ${TEST_RETURNING}`,
+      [id]
+    );
+    await client.query('COMMIT');
+
+    await writeAudit({
+      userId: req.user.userId,
+      entityType: 'lab_test',
+      entityId: id,
+      action: 'DELETE',
+      oldValues: { status: before.status },
+      newValues: { status: 'Cancelled', deleted: 'soft' },
+      ip: req.ip,
+      client,
+    });
+
+    return res.json({ ...updated.rows[0], deleted: 'soft' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    return next(err);
+  } finally {
+    client.release();
+  }
+});
 
 module.exports = router;

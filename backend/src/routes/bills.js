@@ -2,8 +2,9 @@ const express = require('express');
 
 const { pool } = require('../db');
 const { requireRole } = require('../middleware/auth');
-const { audit } = require('../middleware/audit');
+const { audit, writeAudit } = require('../middleware/audit');
 const v = require('../validators');
+const { buildUpdate, diff } = require('../updates');
 
 const router = express.Router();
 
@@ -163,5 +164,237 @@ router.post(
     }
   }
 );
+
+const BILL_RETURNING = `
+  bill_id, bill_number, patient_id, bill_date, service_date, total_amount,
+  discount_amount, insurance_amount, patient_responsibility, paid_amount,
+  status, due_date, created_by, created_at, updated_at
+`;
+
+// bill_number is left out on purpose: it is the reference printed on the
+// patient's copy and quoted on payment. patient_responsibility is derived, so it
+// is not accepted either.
+const UPDATE_HANDLERS = {
+  service_date: (x) => v.optionalDate(x, 'service_date'),
+  due_date: (x) => v.optionalDate(x, 'due_date'),
+  total_amount: (x) => v.money(x, 'total_amount'),
+  discount_amount: (x) => v.money(x, 'discount_amount'),
+  insurance_amount: (x) => v.money(x, 'insurance_amount'),
+  paid_amount: (x) => v.money(x, 'paid_amount'),
+  status: (x) => v.canonicalise(x, v.BILL_STATUSES, 'status'),
+};
+
+const UPDATABLE_BY_ROLE = {
+  Admin: Object.keys(UPDATE_HANDLERS),
+  Accountant: Object.keys(UPDATE_HANDLERS),
+};
+
+const MONEY_FIELDS = ['total_amount', 'discount_amount', 'insurance_amount', 'paid_amount'];
+
+/**
+ * PATCH /api/bills/:id
+ *
+ * Any change to the money fields re-derives patient_responsibility and, unless
+ * the caller states a status explicitly, the status too. Letting a client send
+ * those directly is how a bill ends up marked Paid while still showing a
+ * balance.
+ */
+router.patch('/:id', requireRole('Admin', 'Accountant'), async (req, res, next) => {
+  const id = v.isUuid(req.params.id) ? req.params.id : null;
+  if (!id) return next(new v.ValidationError('bill_id must be a UUID'));
+
+  const client = await pool.connect();
+  try {
+    const { changes } = buildUpdate(req.body, UPDATE_HANDLERS, {
+      allowed: UPDATABLE_BY_ROLE[req.user.role] || [],
+    });
+
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT ${BILL_RETURNING} FROM bills WHERE bill_id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+    const before = existing.rows[0];
+
+    if (before.status === 'Cancelled') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'A cancelled bill cannot be edited',
+        hint: 'Issue a new bill instead',
+      });
+    }
+
+    // Merge requested amounts over the stored ones. NUMERIC comes back from the
+    // driver as a string, so the stored values are parsed before arithmetic.
+    const amounts = {};
+    for (const field of MONEY_FIELDS) {
+      amounts[field] = field in changes ? changes[field] : Number(before[field]);
+    }
+
+    const owed = v.patientResponsibility({
+      total: amounts.total_amount,
+      discount: amounts.discount_amount,
+      insurance: amounts.insurance_amount,
+    });
+
+    if (amounts.paid_amount > owed) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'paid_amount cannot exceed patient_responsibility',
+        paid_amount: amounts.paid_amount,
+        patient_responsibility: owed,
+      });
+    }
+
+    const touchedMoney = MONEY_FIELDS.some((f) => f in changes);
+    let status = 'status' in changes ? changes.status : before.status;
+    if (touchedMoney && !('status' in changes) && before.status !== 'Cancelled') {
+      if (amounts.paid_amount === 0) status = 'Pending';
+      else if (amounts.paid_amount < owed) status = 'Partial';
+      else status = 'Paid';
+    }
+
+    const final = {
+      service_date: 'service_date' in changes ? changes.service_date : before.service_date,
+      due_date: 'due_date' in changes ? changes.due_date : before.due_date,
+      ...amounts,
+      patient_responsibility: owed,
+      status,
+    };
+
+    const updated = await client.query(
+      `UPDATE bills SET
+         service_date = $1, due_date = $2, total_amount = $3, discount_amount = $4,
+         insurance_amount = $5, paid_amount = $6, patient_responsibility = $7,
+         status = $8, updated_at = NOW()
+       WHERE bill_id = $9
+       RETURNING ${BILL_RETURNING}`,
+      [
+        final.service_date, final.due_date, final.total_amount, final.discount_amount,
+        final.insurance_amount, final.paid_amount, final.patient_responsibility,
+        final.status, id,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    const { oldValues, newValues, changed } = diff(before, final);
+    if (changed.length > 0) {
+      await writeAudit({
+        userId: req.user.userId,
+        entityType: 'bill',
+        entityId: id,
+        action: 'UPDATE',
+        oldValues,
+        newValues,
+        ip: req.ip,
+        client,
+      });
+    }
+
+    return res.json({ ...updated.rows[0], changed_fields: changed });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    return next(err);
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /api/bills/:id
+ *
+ * Cancels the bill. Deleting a financial document leaves a gap in the
+ * bill_number sequence, which is exactly what an auditor looks for, so the row
+ * stays and the status changes. Cancellation is refused once money has been
+ * received - that needs a refund or a credit note, neither of which this API
+ * has. ?purge=true is Admin only and refused on the same grounds.
+ */
+router.delete('/:id', requireRole('Admin', 'Accountant'), async (req, res, next) => {
+  const id = v.isUuid(req.params.id) ? req.params.id : null;
+  if (!id) return next(new v.ValidationError('bill_id must be a UUID'));
+
+  const purge = req.query.purge === 'true';
+  if (purge && req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only an Admin may purge a bill' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT ${BILL_RETURNING} FROM bills WHERE bill_id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+    const before = existing.rows[0];
+
+    if (Number(before.paid_amount) > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'A bill with payments against it cannot be cancelled or purged',
+        paid_amount: before.paid_amount,
+        hint: 'Record a refund or issue a credit note first',
+      });
+    }
+
+    if (purge) {
+      if (before.bill_number) {
+        await client.query(
+          `INSERT INTO audit_logs
+             (user_id, entity_type, entity_id, action, old_values, new_values, ip_address)
+           VALUES ($1, 'bill', $2, 'DELETE', $3, $4, $5)`,
+          [
+            req.user.userId, id, JSON.stringify(before),
+            JSON.stringify({ deleted: 'purge', bill_number: before.bill_number }),
+            req.ip || null,
+          ]
+        );
+      }
+      await client.query('DELETE FROM bills WHERE bill_id = $1', [id]);
+      await client.query('COMMIT');
+      return res.json({ bill_id: id, bill_number: before.bill_number, deleted: 'purge' });
+    }
+
+    if (before.status === 'Cancelled') {
+      await client.query('ROLLBACK');
+      return res.json({ ...before, deleted: 'soft', already_cancelled: true });
+    }
+
+    const updated = await client.query(
+      `UPDATE bills SET status = 'Cancelled', updated_at = NOW()
+        WHERE bill_id = $1 RETURNING ${BILL_RETURNING}`,
+      [id]
+    );
+    await client.query('COMMIT');
+
+    await writeAudit({
+      userId: req.user.userId,
+      entityType: 'bill',
+      entityId: id,
+      action: 'DELETE',
+      oldValues: { status: before.status },
+      newValues: { status: 'Cancelled', deleted: 'soft' },
+      ip: req.ip,
+      client,
+    });
+
+    return res.json({ ...updated.rows[0], deleted: 'soft' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    return next(err);
+  } finally {
+    client.release();
+  }
+});
 
 module.exports = router;
