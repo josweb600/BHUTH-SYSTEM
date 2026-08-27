@@ -5,9 +5,15 @@ const { pool } = require('../db');
  * this is called on reads as well as writes. Failures are logged but never
  * block the request.
  */
-async function writeAudit({ userId, entityType, entityId, action, oldValues, newValues, ip }) {
+async function writeAudit({
+  userId, entityType, entityId, action, oldValues, newValues, ip, client,
+}) {
+  // Callers inside a transaction must pass their checked-out client. Reaching for
+  // a second connection from the pool while holding one deadlocks as soon as the
+  // pool is at its limit.
+  const executor = client || pool;
   try {
-    await pool.query(
+    await executor.query(
       `INSERT INTO audit_logs
          (user_id, entity_type, entity_id, action, old_values, new_values, ip_address)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
