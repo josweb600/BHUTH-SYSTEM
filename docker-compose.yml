@@ -1,21 +1,19 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
     container_name: hospital-postgres
     environment:
-      POSTGRES_DB: ehms
-      POSTGRES_USER: hospital_user
-      POSTGRES_PASSWORD: secure_password_change_me
+      POSTGRES_DB: ${POSTGRES_DB:-ehms}
+      POSTGRES_USER: ${POSTGRES_USER:-hospital_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hospital_user -d ehms"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hospital_user} -d ${POSTGRES_DB:-ehms}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -27,11 +25,12 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: development
     container_name: hospital-backend
     environment:
       PORT: 3001
-      DATABASE_URL: postgresql://hospital_user:secure_password_change_me@postgres:5432/ehms
-      JWT_SECRET: your_jwt_secret_key_change_in_production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hospital_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-ehms}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       NODE_ENV: development
     ports:
       - "3001:3001"
@@ -43,17 +42,16 @@ services:
       - /app/node_modules
     networks:
       - hospital-network
-    command: npm run dev
 
-  # Frontend React App
+  # Frontend React App (Vite dev server)
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: development
     container_name: hospital-frontend
     environment:
-      REACT_APP_API_URL: http://localhost:3001/api
-      REACT_APP_ENV: development
+      VITE_API_PROXY: http://backend:3001
     ports:
       - "3000:3000"
     depends_on:
@@ -64,7 +62,7 @@ services:
     networks:
       - hospital-network
 
-  # Redis Cache (Optional but recommended)
+  # Redis Cache (optional but recommended)
   redis:
     image: redis:7-alpine
     container_name: hospital-redis
@@ -80,13 +78,13 @@ services:
       timeout: 5s
       retries: 5
 
-  # pgAdmin for Database Management
+  # pgAdmin for database management
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: hospital-pgadmin
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@hospital.local
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@hospital.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?set PGADMIN_DEFAULT_PASSWORD in .env}
     ports:
       - "5050:80"
     depends_on:
