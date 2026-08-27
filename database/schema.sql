@@ -41,9 +41,15 @@ CREATE TABLE user_sessions (
     ip_address VARCHAR(45),
     user_agent TEXT,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_user_sessions_user (user_id)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- PostgreSQL does not accept INDEX declarations inside CREATE TABLE (that is
+-- MySQL syntax), so these are declared separately.
+CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
+CREATE INDEX idx_user_sessions_access ON user_sessions(access_token);
+CREATE INDEX idx_user_sessions_refresh ON user_sessions(refresh_token);
+CREATE INDEX idx_user_sessions_expires ON user_sessions(expires_at);
 
 CREATE TABLE audit_logs (
     audit_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
