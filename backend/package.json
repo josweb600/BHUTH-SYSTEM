@@ -1,0 +1,26 @@
+{
+  "name": "bhuth-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bule Hora University Teaching Hospital EHMS - REST API",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "db:init": "psql \"$DATABASE_URL\" -f ../database/schema.sql"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
