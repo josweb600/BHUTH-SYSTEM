@@ -10,9 +10,11 @@ backend/            Express REST API
   src/db.js         Shared PostgreSQL connection pool
   src/auth/         Password hashing and JWT signing/verification
   src/middleware/   Bearer-token auth, role checks, audit logging
-  src/routes/       Login, refresh, logout, profile
+  src/routes/       Auth, patients, appointments, lab tests, bills, analytics
+  src/validators.js Request validation mirroring the schema constraints
   scripts/          create-user.js for provisioning accounts
-  test/             Auth unit tests (no database required)
+  test/             Unit tests (no database required)
+  test/integration/ End-to-end tests against a real PostgreSQL instance
   Dockerfile        Multi-stage: development / production
   .env.example      Required environment variables
 frontend/           React single-page app (Vite + Tailwind CSS)
@@ -115,11 +117,20 @@ endpoint:
 Patient reads and all writes are appended to `audit_logs` with the acting user
 and client IP.
 
-Run the auth test suite (no database needed):
+## Tests
 
 ```bash
-cd backend && npm test
+cd backend
+npm test              # unit tests, no database required
+npm run test:integration   # end-to-end against a real PostgreSQL
+npm run test:all
 ```
+
+`npm run test:integration` starts an actual PostgreSQL 18 in-process (PGlite,
+compiled to WebAssembly), loads `database/schema.sql` into it unmodified, and
+drives the running API over HTTP. Nothing is mocked: the CHECK constraints,
+NOT NULL columns, foreign keys and `uuid_generate_v4()` defaults are the real
+ones, so a query that does not match the schema fails the suite.
 
 ## API endpoints
 
@@ -133,7 +144,7 @@ cd backend && npm test
 | GET    | `/api/auth/me`            | Authenticated user's profile         |
 | GET    | `/api/patients`           | List patients (`page`, `limit`, `search`) |
 | GET    | `/api/patients/:id`       | Single patient                       |
-| POST   | `/api/patients`           | Create patient (`mrn`, `first_name`, `last_name` required) |
+| POST   | `/api/patients`           | Create patient (`mrn`, `first_name`, `last_name`, `date_of_birth`, `gender`, `phone` required) |
 | GET    | `/api/appointments`       | Filter by `patient_id`, `status`, `start_date`, `end_date` |
 | POST   | `/api/appointments`       | Schedule an appointment              |
 | GET    | `/api/lab-tests`          | Filter by `patient_id`, `status`     |
@@ -157,6 +168,7 @@ Full request and response examples are in `docs/API_Reference_Documentation.docx
 | `CORS_ORIGIN`  | backend  | Comma-separated allowlist of browser origins |
 | `LOGIN_RATE_LIMIT` | backend | Failed logins per IP per 15 min, default 10 |
 | `TRUST_PROXY_HOPS` | backend | Proxies in front of the API, nginx = 1 |
+| `PG_POOL_MAX`  | backend  | Connection pool size, default 10         |
 | `VITE_API_PROXY` | frontend | Dev-server API target                  |
 
 `.env` is git-ignored. Only `.env.example` is committed — never commit real

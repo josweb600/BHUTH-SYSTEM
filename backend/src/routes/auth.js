@@ -62,7 +62,10 @@ router.post('/login', loginLimiter, async (req, res, next) => {
     }
 
     if (!user.is_active) {
-      return res.status(403).json({ error: 'Account disabled' });
+      // Same response as a wrong password. Telling an anonymous caller that the
+      // account exists but is disabled would undo the enumeration protection
+      // above. Staff who are locked out find out from an administrator.
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const accessToken = signAccessToken({

@@ -13,16 +13,28 @@ function secret() {
   return value;
 }
 
+/**
+ * Every token carries a random jti.
+ *
+ * Without it, two tokens signed for the same user in the same second are byte
+ * identical, because iat has one-second resolution. Rotation would then hand
+ * back the token it was supposed to replace, and a stolen refresh token used
+ * within that second would survive the rotation meant to invalidate it.
+ */
+function jti() {
+  return crypto.randomUUID();
+}
+
 function signAccessToken({ userId, role, employeeId }) {
   return jwt.sign(
-    { sub: userId, role, employee_id: employeeId, typ: 'access' },
+    { sub: userId, role, employee_id: employeeId, typ: 'access', jti: jti() },
     secret(),
     { expiresIn: ACCESS_TTL, issuer: ISSUER }
   );
 }
 
 function signRefreshToken({ userId }) {
-  return jwt.sign({ sub: userId, typ: 'refresh' }, secret(), {
+  return jwt.sign({ sub: userId, typ: 'refresh', jti: jti() }, secret(), {
     expiresIn: REFRESH_TTL,
     issuer: ISSUER,
   });
