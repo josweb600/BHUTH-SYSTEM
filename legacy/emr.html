@@ -581,7 +581,7 @@
 
         function logout() {
             localStorage.removeItem('user');
-            window.location.href = 'login.html';
+            window.location.href = '../index.html';
         }
 
         function downloadPDF() {
@@ -596,7 +596,7 @@
         window.onload = function() {
             const user = localStorage.getItem('user');
             if (!user) {
-                window.location.href = 'login.html';
+                window.location.href = '../index.html';
             }
         };
     </script>
